@@ -21,8 +21,8 @@ Status legend: `✅ done` · `🟡 active` · `⬜ queued` · `🧪 exploratory`
 | ✅ | HSTU cached inference | full↔cached parity validated |
 | ✅ | HSTU Triton inference | cached Torch↔Triton parity validated; 1k–10k latency curve recorded |
 | 🟡 | HSTU canonical stamp | regenerate durable mature checkpoints, rerun finalizer, freeze |
-| ⬜ | SASRec sampled softmax | reproduce published-protocol behavior |
-| ⬜ | eSASRec / LiGR | run matched 2×2 control: SASRec/LiGR × FullCE/SS |
+| 🟡 | SASRec sampled softmax | per-position catalog-uniform SS256 fixed; Beauty 2×2 reproduction running |
+| 🟡 | eSASRec / LiGR | LiGR reference gates/SwiGLU aligned; run SASRec/LiGR × FullCE/SS, then ML-1M literature sanity |
 | ⬜ | Mamba quality | portable no-custom-compile reference implementation |
 | ⬜ | Mamba recurrent inference | constant-state one-event path + parity |
 
