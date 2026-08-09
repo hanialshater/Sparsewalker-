@@ -6,6 +6,7 @@ from .fmlprec import FMLPRec
 from .bert4rec import BERT4Rec
 from .hstu import HSTU
 from .sparsewalker import SparseWalker, SparseWalkerE2E
+from .temporal_walker import SparseWalkerTemporalMemory
 from .mamba4rec import Mamba4Rec, HAS_MAMBA
 
-__all__ = ["MostPop","SASRec","ESASRec","GRU4Rec","FMLPRec","BERT4Rec","HSTU","SparseWalker","SparseWalkerE2E","Mamba4Rec","HAS_MAMBA"]
+__all__ = ["MostPop","SASRec","ESASRec","GRU4Rec","FMLPRec","BERT4Rec","HSTU","SparseWalker","SparseWalkerE2E","SparseWalkerTemporalMemory","Mamba4Rec","HAS_MAMBA"]
