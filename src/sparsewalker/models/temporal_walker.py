@@ -10,10 +10,16 @@ class SparseWalkerTemporalMemory(SparseWalker):
     """Sparse Walker with three sparse temporal landmark memories.
 
     The base Walker state still has K active concepts and follows the same
-    learned concept graph.  In addition, a tiny set of frozen-in-time concept
-    snapshots can be read before the first graph hop at each event.  This gives
+    learned concept graph. In addition, a tiny set of frozen-in-time concept
+    snapshots can be read before the first graph hop at each event. This gives
     old information a direct temporal shortcut instead of requiring it to
     survive every intermediate merge/top-k transition.
+
+    Landmark writes are detached gradient boundaries. This is intentional:
+    without detaching, every saved state is reused by many later time steps and
+    creates a large fan-out of long BPTT branches. Forward information still
+    travels through the skip, while the memory query/gating and current concept
+    values remain trainable.
 
     The default schedules are intentionally staggered for max_len~=200:
       short  : every 16 events       -> recent landmark
@@ -61,13 +67,9 @@ class SparseWalkerTemporalMemory(SparseWalker):
             raise ValueError("memory periods must be positive")
         self.n_memories = len(self.memory_periods)
 
-        # Query the sparse landmarks using the current item context.  The bias
-        # lets the model learn a stable preference for a temporal scale.
         self.memory_q = nn.Linear(d, d, bias=False)
         self.memory_bias = nn.Parameter(torch.zeros(self.n_memories))
 
-        # This is the fraction of the *old-state branch* allocated to memory.
-        # The fresh item keeps exactly the base Walker fresh_weight.
         p = float(initial_memory_share)
         if not 0.0 < p < 1.0:
             raise ValueError("initial_memory_share must be in (0,1)")
@@ -76,7 +78,8 @@ class SparseWalkerTemporalMemory(SparseWalker):
     def _read_memory(self, old_ids, old_mass, fresh_ids, fresh_mass, context,
                      memory_ids, memory_mass, memory_valid):
         """Merge current/fresh state with a query-weighted sparse memory read."""
-        # [B,M,K,d] -> [B,M,d]
+        # IDs/masses are detached snapshots, but concept values are looked up
+        # through the live ConceptSpace so representation learning still flows.
         mem_values = self.space.value(memory_ids)
         mem_vec = (mem_values * memory_mass[..., None]).sum(2)
         q = F.normalize(self.memory_q(context), dim=-1)
@@ -88,8 +91,6 @@ class SparseWalkerTemporalMemory(SparseWalker):
         raw = torch.exp(shifted) * valid_f
         gates = raw / (raw.sum(-1, keepdim=True) + 1e-8)
 
-        # Preserve the base fresh-vs-old split.  Memory borrows mass only from
-        # the old-state branch, and only for rows that have a valid landmark.
         old_budget = 1.0 - self.fresh_weight
         share = torch.sigmoid(self.memory_share_logit)
         has_memory = memory_valid.any(-1).to(old_mass.dtype)
@@ -129,7 +130,6 @@ class SparseWalkerTemporalMemory(SparseWalker):
         ids = torch.zeros(B, self.active, dtype=torch.long, device=seq.device)
         mass = torch.zeros(B, self.active, dtype=item_state.dtype, device=seq.device)
 
-        # Lists keep updates functional so gradients can use the temporal skip.
         memory_ids = [torch.zeros_like(ids) for _ in range(self.n_memories)]
         memory_mass = [torch.zeros_like(mass) for _ in range(self.n_memories)]
         memory_valid = [torch.zeros(B, dtype=torch.bool, device=seq.device)
@@ -152,8 +152,6 @@ class SparseWalkerTemporalMemory(SparseWalker):
             mmass = torch.stack(memory_mass, 1)
             mvalid = torch.stack(memory_valid, 1)
 
-            # First hop gets the temporal shortcut.  Remaining hops retain the
-            # original Walker update, keeping the ablation as small as possible.
             xids, xmass = self._read_memory(
                 xids, xmass, fids, fmass, item_state[:, t], mids, mmass, mvalid
             )
@@ -174,13 +172,16 @@ class SparseWalkerTemporalMemory(SparseWalker):
             ids = torch.where(act[:, None], xids, ids)
             mass = torch.where(act[:, None], xmass, mass)
 
-            # Write after the read/update, so a landmark is never used to predict
-            # the very event that created it.
+            # Detached writes bound backward complexity while preserving the
+            # exact forward landmark state. IDs are discrete already; masses
+            # are the important gradient boundary.
             step = t + 1
             for j in range(self.n_memories):
                 if self._should_write(step, j):
-                    memory_ids[j] = torch.where(act[:, None], ids, memory_ids[j])
-                    memory_mass[j] = torch.where(act[:, None], mass, memory_mass[j])
+                    snap_ids = ids.detach()
+                    snap_mass = mass.detach()
+                    memory_ids[j] = torch.where(act[:, None], snap_ids, memory_ids[j])
+                    memory_mass[j] = torch.where(act[:, None], snap_mass, memory_mass[j])
                     memory_valid[j] = memory_valid[j] | act
 
             msg = (self.space.value(ids) * mass[:, :, None]).sum(1)
