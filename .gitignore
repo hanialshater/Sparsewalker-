@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data / checkpoints / generated results
+data/
+checkpoints/
+artifacts/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Experiment logs
+logs/
+wandb/
+tensorboard/
+
+# Build / kernels
+build/
+dist/
+*.egg-info/
+.cache/
+
+# Local environment
+.env
+.DS_Store
