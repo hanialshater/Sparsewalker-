@@ -4,6 +4,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .core import ARRecommender, init_embedding, autoregressive_inputs
 
+
+def _coalesced_topk(ids, mass, k):
+    """Sum duplicate concept masses before pruning to the top-k states."""
+    same = ids.unsqueeze(-1).eq(ids.unsqueeze(-2))
+    summed = (same.to(mass.dtype) * mass.unsqueeze(-2)).sum(-1)
+    repeated = torch.tril(same, diagonal=-1).any(-1)
+    summed = summed.masked_fill(repeated, 0.0)
+    v, slot = summed.topk(min(int(k), summed.size(-1)), dim=-1)
+    out_ids = ids.gather(-1, slot)
+    v = v / (v.sum(-1, keepdim=True) + 1e-8)
+    return out_ids, v
+
+
 class ConceptSpace(nn.Module):
     def __init__(self,d,side,h):
         super().__init__(); self.side=side; self.h=h
@@ -17,6 +30,7 @@ class ConceptSpace(nn.Module):
     def key(self,ids):
         l,r=self.split(ids); return F.normalize(self.left_key[l]+self.right_key[r],dim=-1)
 
+
 class Router(nn.Module):
     def __init__(self,d,h,top_side,side):
         super().__init__(); self.top_side=top_side; self.side=side
@@ -29,6 +43,7 @@ class Router(nn.Module):
         logits=(lv.unsqueeze(-1)+rv.unsqueeze(-2)).reshape(hidden.size(0),-1)
         return ids,F.softmax(logits,-1)
 
+
 class CompactGraph(nn.Module):
     def __init__(self,d,h,n_concepts,degree,active):
         super().__init__(); self.n_concepts=n_concepts; self.degree=degree; self.active=active
@@ -37,7 +52,7 @@ class CompactGraph(nn.Module):
         self.register_buffer("destination",dest); self.register_buffer("touched",torch.zeros(n_concepts,dtype=torch.bool),persistent=False)
         self.context_q=nn.Linear(d,h,bias=False); self.scale=nn.Parameter(torch.tensor(math.log(3.0)))
     def topk(self,ids,mass):
-        v,slot=mass.topk(self.active,-1); ids=ids.gather(-1,slot); v=v/(v.sum(-1,keepdim=True)+1e-8); return ids,v
+        return _coalesced_topk(ids,mass,self.active)
     @torch.no_grad()
     def mark_touched(self,ids):
         if ids.numel(): self.touched[ids.detach().reshape(-1)]=True
@@ -58,6 +73,7 @@ class CompactGraph(nn.Module):
             if st.get(k) is not None: st[k][rr,repl]=0
         n=int(rows.numel()); self.touched.zero_(); return n
 
+
 class SparseWalker(ARRecommender):
     def __init__(self,n_items,max_len,d=64,layers=2,side=256,h=16,active=8,top_side=2,degree=4,fresh_weight=.25):
         super().__init__(n_items,max_len,d); self.layers_n=layers; self.side=side; self.h=h; self.active=active; self.degree=degree; self.fresh_weight=fresh_weight
@@ -68,7 +84,7 @@ class SparseWalker(ARRecommender):
     @property
     def item_weight(self): return self.item.weight
     def _top(self,ids,mass):
-        v,s=mass.topk(self.active,-1); ids=ids.gather(-1,s); v=v/(v.sum(-1,keepdim=True)+1e-8); return ids,v
+        return _coalesced_topk(ids,mass,self.active)
     def _merge(self,oi,om,fi,fm):
         return self._top(torch.cat([oi,fi],-1),torch.cat([(1-self.fresh_weight)*om,self.fresh_weight*fm],-1))
     def _encode_impl(self,seq,return_states):
@@ -79,10 +95,13 @@ class SparseWalker(ARRecommender):
         touched_sources=[] if self.training else None
         for t in range(L):
             act=valid[:,t]; af=act.to(item_state.dtype)[:,None]; xids=ids; xmass=mass*af; fids=fi[:,t]; fmass=fm[:,t]*af
+
+            # v1.1: inject the current item once per event, not once per graph hop.
+            xids,xmass=self._merge(xids,xmass,fids,fmass)
             for _ in range(self.layers_n):
-                xids,xmass=self._merge(xids,xmass,fids,fmass)
                 if touched_sources is not None: touched_sources.append(xids.detach())
                 xids,xmass=self.graph(xids,xmass,item_state[:,t],self.space,track_touched=False)
+
             ids=torch.where(act[:,None],xids,ids); mass=torch.where(act[:,None],xmass,mass)
             msg=(self.space.value(ids)*mass[:,:,None]).sum(1); h=self.norm(item_state[:,t]+self.message_proj(msg))*af
             outs.append(h)
@@ -95,6 +114,7 @@ class SparseWalker(ARRecommender):
         return H
     def encode_with_states(self,seq): return self._encode_impl(seq,True)
     def encode(self,seq): return self._encode_impl(seq,False)
+
 
 class SparseWalkerE2E(SparseWalker):
     def __init__(self,n_items,max_len,d=64,layers=2,side=256,h=16,active=8,top_side=2,degree=4,fresh_weight=.25,terminal_degree=128):
