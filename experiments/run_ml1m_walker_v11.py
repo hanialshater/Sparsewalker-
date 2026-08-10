@@ -8,7 +8,7 @@ Changes under test versus the previous Walker:
 
 Everything else intentionally stays aligned with the existing canonical ML-1M
 Walker run: same data, split, full-catalog evaluator, max_len=200, K=8,
-degree=4, two graph hops, FullCE, AdamW, BF16, and length-bucketed batches.
+degree=4, two graph hops, FullCE, AdamW, BF16 training, and length-bucketed batches.
 """
 import argparse
 import hashlib
@@ -73,7 +73,6 @@ def set_lr(optimizer, epoch, max_epochs, peak=1e-3, min_lr=1e-4, warmup=3):
 
 @torch.inference_mode()
 def state_diagnostic(model, prefixes, max_len, device, cap=256):
-    # Prefer genuinely long histories so duplicate-state pathologies have time to emerge.
     chosen = [p for p in prefixes if min(len(p), max_len) > 100][:cap]
     if not chosen:
         chosen = list(prefixes[:cap])
@@ -149,6 +148,8 @@ def main():
         "max_len": max_len,
         "objective": "FullCE",
         "warm_start": False,
+        "training_precision": "BF16 autocast",
+        "evaluation_precision": "canonical / no autocast override",
     }, flush=True)
 
     model = SparseWalker(
@@ -194,7 +195,6 @@ def main():
             val = evaluate_full(
                 model, split["val_prefix"], split["val_target"], data["n_items"],
                 max_len, device, topks=(10,), batch_size=args.eval_batch_size,
-                autocast_dtype=torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else None,
             )
             diag = state_diagnostic(model, split["val_prefix"], max_len, device)
             erow = {**row, **val}
@@ -228,12 +228,10 @@ def main():
     final_val = evaluate_full(
         model, split["val_prefix"], split["val_target"], data["n_items"],
         max_len, device, topks=(10,), batch_size=args.eval_batch_size,
-        autocast_dtype=torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else None,
     )
     test = evaluate_full(
         model, split["test_prefix"], split["test_target"], data["n_items"],
         max_len, device, topks=(10,20,50), batch_size=args.eval_batch_size,
-        autocast_dtype=torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else None,
     )
     result = {
         "cell": "SparseWalker-v1.1-FullCE",
