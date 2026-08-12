@@ -54,13 +54,16 @@ if HAS_TRITON:
         score0 = tl.sum(k0 * q[None, :], axis=1)
         score0 = tl.where(valid0, score0, neg)
 
+        # Triton loop-carried values must retain a fixed tensor shape. Keep the
+        # BEAM-wide entry-selection scratch distinct from the CAND_PAD-wide
+        # per-hop candidate scratch below.
         beam_ids = tl.full((BEAM,), -1, tl.int32)
-        work = score0
+        work_entry = score0
         for j in range(BEAM):
-            ix = tl.argmax(work, axis=0)
+            ix = tl.argmax(work_entry, axis=0)
             cid = tl.sum(tl.where(b == ix, safe0, 0), axis=0).to(tl.int32)
             beam_ids = tl.where(b == j, cid, beam_ids)
-            work = tl.where(safe0 == cid, neg, work)
+            work_entry = tl.where(safe0 == cid, neg, work_entry)
 
         # Fixed-budget beam walk. Each hop rescans the current beam plus all of
         # its fixed-degree neighbors, then keeps the unique top BEAM by q·k.
@@ -82,17 +85,17 @@ if HAS_TRITON:
                 K + (pid * L + safe[:, None]) * HD + d[None, :],
                 mask=valid[:, None], other=0.0,
             ).to(tl.float32)
-            score = tl.sum(kk * q[None, :], axis=1)
-            score = tl.where(valid, score, neg)
+            score_cand = tl.sum(kk * q[None, :], axis=1)
+            score_cand = tl.where(valid, score_cand, neg)
 
             next_ids = tl.full((BEAM,), -1, tl.int32)
-            work = score
+            work_cand = score_cand
             for j in range(BEAM):
-                ix = tl.argmax(work, axis=0)
+                ix = tl.argmax(work_cand, axis=0)
                 cid = tl.sum(tl.where(c == ix, safe, 0), axis=0).to(tl.int32)
                 next_ids = tl.where(b == j, cid, next_ids)
                 # Remove duplicate occurrences of the selected graph node.
-                work = tl.where(safe == cid, neg, work)
+                work_cand = tl.where(safe == cid, neg, work_cand)
             beam_ids = next_ids
 
         validf = (beam_ids >= 0) & (beam_ids < n)
