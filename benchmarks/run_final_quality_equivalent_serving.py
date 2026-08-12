@@ -28,7 +28,6 @@ separately; training-precision provenance is printed as a fairness caveat.
 
 import argparse
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -38,7 +37,7 @@ import torch.nn as nn
 
 from sparsewalker.data import load_dataset, split_data
 from sparsewalker.evaluation import evaluate_full
-from sparsewalker.models import SASRec, SparseWalker
+from sparsewalker.models import SASRec
 from sparsewalker.serving.walker_triton import term_block, term_merge
 
 
@@ -76,9 +75,9 @@ class WalkerExactWindow(nn.Module):
     def __init__(self, model):
         super().__init__(); self.model=model
     def forward(self, seq, lens):
-        # encode_with_states is inherited from SparseWalker and intentionally bypasses
-        # the subclass encode override, giving the exact local Walker sequence once.
-        H,I,M = SparseWalker.encode_with_states(self.model,seq)
+        # _encode_impl is the inherited local Walker recurrence only; applying the
+        # two temporal blocks below exactly reproduces the subclass encode path.
+        H,I,M = self.model._encode_impl(seq,True)
         H = self.model.temporal1(H,seq.eq(0))
         H = self.model.temporal2(H,seq.eq(0))
         rows=torch.arange(seq.size(0),device=seq.device)
@@ -89,12 +88,13 @@ class WalkerExactWindow(nn.Module):
 def make_terminal(model,device,catalog,degree=64):
     K=8; D=64; C=256*256; total=K*degree; keep=16; blocks=(total+127)//128
     support=torch.randint(1,catalog+1,(C*degree,),device=device,dtype=torch.int32)
-    # Use the actual tied item table, padded if the synthetic serving catalog exceeds ML-1M.
+    # Terminal kernels use 1-based item IDs, so keep an explicit row 0.
+    emb=torch.zeros(catalog+1,D,device=device,dtype=torch.bfloat16)
     if catalog<=model.n_items:
-        emb=model.item_weight[1:catalog+1].detach().to(device=device,dtype=torch.bfloat16).contiguous()
+        emb[1:catalog+1].copy_(model.item_weight[1:catalog+1].detach().to(torch.bfloat16))
     else:
-        emb=torch.randn(catalog,D,device=device,dtype=torch.bfloat16)*.02
-        emb[:model.n_items].copy_(model.item_weight[1:model.n_items+1].detach().to(torch.bfloat16))
+        emb[1:].normal_(0.0,.02)
+        emb[1:model.n_items+1].copy_(model.item_weight[1:model.n_items+1].detach().to(torch.bfloat16))
     bi=torch.empty(blocks*keep,device=device,dtype=torch.int32)
     bs=torch.empty(blocks*keep,device=device,dtype=torch.float32)
     out=torch.empty(10,device=device,dtype=torch.int32)
@@ -180,6 +180,7 @@ def main():
     seq=torch.randint(1,data["n_items"]+1,(1,200),device=device,dtype=torch.long)
     lens=torch.tensor([200],device=device,dtype=torch.long)
     new_item=torch.tensor([17],device=device,dtype=torch.long)
+    shift_scratch=torch.empty((1,199),device=device,dtype=torch.long)
     cand_ids=torch.randint(1,data["n_items"]+1,(512,),device=device,dtype=torch.long)
     cand_emb=sas.item_weight[cand_ids].detach().contiguous()
     terminal=make_terminal(walker,device,args.catalog,degree=64)
@@ -197,8 +198,8 @@ def main():
     print("COMPILE",compile_status,flush=True)
 
     def shift_seq():
-        # Include the tiny fixed-window request-state update symmetrically in SASRec.
-        seq[:,:-1].copy_(seq[:,1:].clone()); seq[:,-1].copy_(new_item)
+        # Fixed buffers only, so the request-state update is CUDA-Graph safe.
+        shift_scratch.copy_(seq[:,1:]); seq[:,:-1].copy_(shift_scratch); seq[:,-1].copy_(new_item)
 
     def sas_model():
         shift_seq(); return srun(seq,lens)
