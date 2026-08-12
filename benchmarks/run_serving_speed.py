@@ -147,13 +147,13 @@ def temporal_candidate_read(
 
 
 def make_sasrec(device, max_len=2048):
-    # Same geometry as the canonical ML-1M SASRec baseline.
+    # Exact canonical ML-1M SASRec geometry: d=64, 2 blocks, 1 head.
     return SASRec(
         n_items=4096,
         max_len=max_len,
         d=64,
         layers=2,
-        heads=2,
+        heads=1,
         inner=256,
         dropout=0.0,
         ligr=False,
@@ -185,7 +185,7 @@ def bench_sasrec_incremental(device, lengths, compile_model=True):
             print("TORCH_COMPILE_INCREMENTAL_SKIPPED", repr(e), flush=True)
 
     rows = []
-    B, H, D, HD = 1, 2, 64, 32
+    B, H, D, HD = 1, 1, 64, 64
     x = torch.randn(B, D, device=device, dtype=torch.bfloat16)
     for L in lengths:
         caches = [
@@ -257,6 +257,7 @@ def bench_walker_local(device):
 
 
 def bench_temporal_sparse_proxy(device, R=96, layers=2):
+    # Current Walker temporal blocks are 2 heads => head dim 32.
     H, HD, KEEP = 2, 32, 16
     q = torch.randn(H, HD, device=device, dtype=torch.bfloat16)
     keys = [torch.randn(H, R, HD, device=device, dtype=torch.bfloat16) for _ in range(layers)]
@@ -325,10 +326,11 @@ def main():
         "batch": 1,
         "d_model": 64,
         "sasrec_layers": 2,
-        "sasrec_heads": 2,
+        "sasrec_heads": 1,
         "walker_K": 8,
         "walker_degree": 4,
         "walker_graph_hops": 2,
+        "walker_temporal_heads": 2,
         "temporal_layers": 2,
         "temporal_topk": 16,
         "temporal_candidate_reads_per_head": 96,
@@ -373,7 +375,7 @@ def main():
         "caveats": [
             "Walker temporal number is a fused GPU compute proxy over 96 visited candidates/head; it excludes actual graph-index pointer chasing.",
             "Existing FAISS HNSW prototype is CPU/per-user and is intentionally not treated as production latency.",
-            "SASRec KV benchmark measures an exact one-token two-layer attention step over cached history.",
+            "SASRec KV benchmark measures an exact one-token two-layer, one-head attention step over cached history.",
             "Final Walker retrieval scores 8*64=512 reachable items; SASRec dense retrieval scores the entire catalog.",
             "All numbers are batch=1 kernel/compute latency on the reported GPU, not service p99.",
         ],
