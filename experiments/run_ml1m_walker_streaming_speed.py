@@ -28,6 +28,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -50,7 +51,12 @@ from run_ml1m_walker_streaming_native import (  # noqa: E402
 
 
 class FastStreamingSparseWalker(StreamingSparseWalker):
-    """StreamingSparseWalker with an optionally compiled local chunk."""
+    """StreamingSparseWalker with an optionally compiled local chunk.
+
+    The local recurrence is copied exactly from PR17's `local_chunk`, except
+    that state is passed as tensors (never None) to give torch.compile a stable
+    signature. The temporal layers are unchanged.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -90,6 +96,8 @@ class FastStreamingSparseWalker(StreamingSparseWalker):
     def enable_local_compile(self, mode="reduce-overhead"):
         if not hasattr(torch, "compile"):
             raise RuntimeError("torch.compile is unavailable in this PyTorch build")
+        # dynamic=False deliberately specializes for the common [B,64] training
+        # chunk. The trainer pads only the final chunk to keep C fixed.
         self._compiled_local = torch.compile(
             self._local_chunk_from_state,
             mode=mode,
@@ -102,6 +110,7 @@ class FastStreamingSparseWalker(StreamingSparseWalker):
         self._use_compiled_local = bool(enabled) and self._compiled_local is not None
 
     def local_chunk(self, seq, state=None, return_ids=False):
+        # Preserve the PR17 path for the uncommon ID-history diagnostic.
         if return_ids:
             return super().local_chunk(seq, state, return_ids=True)
 
@@ -188,9 +197,10 @@ def train_epoch_fast(
 ):
     """Streaming TBPTT with no inner-loop CPU synchronization.
 
-    Local and temporal states are detached after every chunk, so chunk graphs are
-    independent. Summing several chunk losses before one backward() gives the
-    same accumulated gradient as backward() on each chunk separately.
+    Because local + temporal states are detached after every chunk, chunk
+    computational graphs are independent. Summing N chunk losses before one
+    backward() produces the same accumulated gradient as N backward() calls;
+    it only reduces Python/autograd launch overhead.
     """
     model.train()
     batches = make_batches(seqs, batch_size, seed, epoch)
@@ -208,6 +218,7 @@ def train_epoch_fast(
         if valid_total <= 0:
             continue
 
+        # No CUDA reduction is needed to decide how many chunks exist.
         T = max(lengths)
         opt.zero_grad(set_to_none=True)
         local_state = None
@@ -240,11 +251,13 @@ def train_epoch_fast(
                 loss_sum = F.cross_entropy(logits.float(), yv, reduction="sum")
                 loss = loss_sum / float(valid_total)
 
+            # Keep telemetry on GPU until the end of the epoch.
             epoch_loss_sum = epoch_loss_sum + loss_sum.detach()
             pending = loss if pending is None else pending + loss
             pending_chunks += 1
             chunk_count += 1
 
+            # Preserve PR17 TBPTT semantics exactly.
             local_state, temporal_states = model.detach_states(
                 local_state, temporal_states
             )
@@ -281,7 +294,7 @@ def train_epoch_fast(
 
 @torch.inference_mode()
 def local_parity_test(model, device, batch=8, chunk=64):
-    """Compiled local recurrence must preserve hidden/IDs/masses."""
+    """Fast eager and compiled local recurrence must match the PR17 reference."""
     model.eval()
     seq = torch.randint(1, model.n_items + 1, (batch, chunk), device=device)
     seq[0, -7:] = 0
@@ -290,38 +303,129 @@ def local_parity_test(model, device, batch=8, chunk=64):
         batch, model.active, device=device, dtype=model.item.weight.dtype
     )
 
-    model.set_local_compile(False)
+    # Call the parent method explicitly so this cannot compare the optimized
+    # implementation against itself.
     with torch.autocast(
         "cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"
     ):
-        h0, i0, m0 = model._local_chunk_from_state(seq, ids.clone(), mass.clone())
+        href, (iref, mref), _ = StreamingSparseWalker.local_chunk(
+            model,
+            seq,
+            (ids.clone(), mass.clone()),
+            return_ids=False,
+        )
+        h0, i0, m0 = model._local_chunk_from_state(
+            seq, ids.clone(), mass.clone()
+        )
+
+    out = {
+        "fast_eager_hidden_max_abs": float(
+            (href.float() - h0.float()).abs().max().cpu()
+        ),
+        "fast_eager_mass_max_abs": float(
+            (mref.float() - m0.float()).abs().max().cpu()
+        ),
+        "fast_eager_ids_match": bool(torch.equal(iref, i0)),
+        "compiled": model._compiled_local is not None,
+    }
+
+    eager_ok = (
+        out["fast_eager_ids_match"]
+        and out["fast_eager_hidden_max_abs"] <= 1e-5
+        and out["fast_eager_mass_max_abs"] <= 1e-6
+    )
 
     if model._compiled_local is None:
-        return {
-            "compiled": False,
-            "hidden_max_abs": 0.0,
-            "mass_max_abs": 0.0,
-            "ids_match": True,
-            "accepted": True,
-        }
+        out.update(
+            {
+                "compiled_hidden_max_abs": 0.0,
+                "compiled_mass_max_abs": 0.0,
+                "compiled_ids_match": True,
+                "accepted": eager_ok,
+            }
+        )
+        return out
 
-    model.set_local_compile(True)
     with torch.autocast(
         "cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"
     ):
-        h1, i1, m1 = model._compiled_local(seq, ids.clone(), mass.clone())
-    out = {
-        "compiled": True,
-        "hidden_max_abs": float((h0.float() - h1.float()).abs().max().cpu()),
-        "mass_max_abs": float((m0.float() - m1.float()).abs().max().cpu()),
-        "ids_match": bool(torch.equal(i0, i1)),
-    }
+        h1, i1, m1 = model._compiled_local(
+            seq, ids.clone(), mass.clone()
+        )
+    out.update(
+        {
+            "compiled_hidden_max_abs": float(
+                (href.float() - h1.float()).abs().max().cpu()
+            ),
+            "compiled_mass_max_abs": float(
+                (mref.float() - m1.float()).abs().max().cpu()
+            ),
+            "compiled_ids_match": bool(torch.equal(iref, i1)),
+        }
+    )
     out["accepted"] = (
-        out["ids_match"]
-        and out["hidden_max_abs"] <= 5e-2
-        and out["mass_max_abs"] <= 5e-3
+        eager_ok
+        and out["compiled_ids_match"]
+        and out["compiled_hidden_max_abs"] <= 5e-2
+        and out["compiled_mass_max_abs"] <= 5e-3
     )
     return out
+
+
+def grouped_backward_parity_test(n_items, device, memory_size=512):
+    """One optimizer step: backward-per-chunk vs grouped backward."""
+    seed_all(777)
+    base = build_model(n_items, memory_size).to(device)
+    state = cpu_state_dict(base)
+    del base
+
+    # Synthetic histories force three 64-event chunks.
+    rng = np.random.default_rng(123)
+    seqs = [
+        rng.integers(1, n_items + 1, size=150).tolist()
+        for _ in range(4)
+    ]
+
+    def one(group):
+        seed_all(999)
+        m = build_model(n_items, memory_size).to(device)
+        m.load_state_dict(state)
+        m.set_local_compile(False)
+        opt = torch.optim.AdamW(m.parameters(), lr=1e-3, weight_decay=1e-4)
+        seed_all(2026)
+        stats = train_epoch_fast(
+            m,
+            seqs,
+            opt,
+            device,
+            batch_size=4,
+            chunk_size=64,
+            seed=42,
+            epoch=1,
+            use_bf16=True,
+            backward_group_chunks=group,
+            max_batches=1,
+        )
+        return cpu_state_dict(m), stats
+
+    s1, a = one(1)
+    sg, b = one(4)
+    max_abs = 0.0
+    worst = None
+    for k in s1:
+        if not torch.is_floating_point(s1[k]):
+            continue
+        d = float((s1[k].float() - sg[k].float()).abs().max())
+        if d > max_abs:
+            max_abs = d
+            worst = k
+    return {
+        "max_abs_parameter_delta": max_abs,
+        "worst_parameter": worst,
+        "group1_backward_calls": a["backward_calls"],
+        "group4_backward_calls": b["backward_calls"],
+        "accepted": max_abs <= 2e-5,
+    }
 
 
 def _warm_for_benchmark(
@@ -383,50 +487,63 @@ def benchmark_speed(
     modes = [False, True] if try_compile else [False]
     for compile_local in modes:
         for batch_size in batch_sizes:
-            _warm_for_benchmark(
-                model,
-                base_state,
-                split["train"],
-                device,
-                batch_size=batch_size,
-                chunk_size=chunk_size,
-                seed=seed,
-                compile_local=compile_local,
-                backward_group_chunks=backward_group_chunks,
-            )
-            model.load_state_dict(base_state)
-            model.set_local_compile(compile_local)
-            parity = local_parity_test(
-                model, device, batch=min(8, batch_size), chunk=chunk_size
-            )
-            if not parity["accepted"]:
-                rows.append(
-                    {
-                        "batch_size": batch_size,
-                        "compiled_local": compile_local,
-                        "status": "PARITY_FAIL",
-                        "parity": parity,
-                    }
+            try:
+                _warm_for_benchmark(
+                    model,
+                    base_state,
+                    split["train"],
+                    device,
+                    batch_size=batch_size,
+                    chunk_size=chunk_size,
+                    seed=seed,
+                    compile_local=compile_local,
+                    backward_group_chunks=backward_group_chunks,
                 )
-                model.set_local_compile(False)
-                continue
+                model.load_state_dict(base_state)
+                model.set_local_compile(compile_local)
+                parity = local_parity_test(
+                    model, device, batch=min(8, batch_size), chunk=chunk_size
+                )
+                if not parity["accepted"]:
+                    rows.append(
+                        {
+                            "batch_size": batch_size,
+                            "compiled_local": compile_local,
+                            "status": "PARITY_FAIL",
+                            "parity": parity,
+                        }
+                    )
+                    model.set_local_compile(False)
+                    continue
 
-            opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-            stats = train_epoch_fast(
-                model,
-                split["train"],
-                opt,
-                device,
-                batch_size=batch_size,
-                chunk_size=chunk_size,
-                seed=seed,
-                epoch=1,
-                backward_group_chunks=backward_group_chunks,
-                max_batches=benchmark_batches,
-            )
-            row = {**stats, "status": "OK", "parity": parity}
-            rows.append(row)
-            print("SPEED_CELL", json.dumps(row), flush=True)
+                opt = torch.optim.AdamW(
+                    model.parameters(), lr=1e-3, weight_decay=1e-4
+                )
+                stats = train_epoch_fast(
+                    model,
+                    split["train"],
+                    opt,
+                    device,
+                    batch_size=batch_size,
+                    chunk_size=chunk_size,
+                    seed=seed,
+                    epoch=1,
+                    backward_group_chunks=backward_group_chunks,
+                    max_batches=benchmark_batches,
+                )
+                row = {**stats, "status": "OK", "parity": parity}
+                rows.append(row)
+                print("SPEED_CELL", json.dumps(row), flush=True)
+            except Exception as exc:
+                model.set_local_compile(False)
+                row = {
+                    "batch_size": batch_size,
+                    "compiled_local": compile_local,
+                    "status": "ERROR",
+                    "error": repr(exc),
+                }
+                rows.append(row)
+                print("SPEED_CELL_ERROR", json.dumps(row), flush=True)
 
     return rows
 
@@ -451,6 +568,7 @@ def train_full(args, data, split, device):
             print("LOCAL_COMPILE_DISABLED", repr(exc), flush=True)
             model.set_local_compile(False)
 
+    # Existing PR17 correctness gates run on the eager reference semantics.
     compile_state = model._use_compiled_local
     model.set_local_compile(False)
     chunk_invariance_test(model, device)
@@ -505,6 +623,8 @@ def train_full(args, data, split, device):
         print("TRAIN_FAST", json.dumps(tr), flush=True)
 
         if epoch == 1 or epoch % args.eval_every == 0:
+            # Evaluation uses eager local chunks to avoid variable-length
+            # recompiles; weights and model semantics are unchanged.
             comp = model._use_compiled_local
             model.set_local_compile(False)
             val_full = evaluate_streaming(
@@ -603,7 +723,9 @@ def train_full(args, data, split, device):
         "test_reset200": test_reset200,
         "config": config,
     }
-    (out / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True))
+    (out / "result.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True)
+    )
     print("FINAL_FAST", json.dumps(result, indent=2), flush=True)
 
 
@@ -624,7 +746,7 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--backward-group-chunks", type=int, default=4)
     p.add_argument(
-        "--compile-local", action=argparse.BooleanOptionalAction, default=True
+        "--compile-local", action=argparse.BooleanOptionalAction, default=False
     )
 
     p.add_argument("--benchmark-only", action="store_true")
@@ -659,6 +781,13 @@ def main():
 
     data = load_dataset("ml1m", args.data_dir)
     split = split_data(data["sequences"])
+
+    grad_gate = grouped_backward_parity_test(
+        data["n_items"], device, memory_size=args.memory_size
+    )
+    print("GROUPED_BACKWARD_PARITY", json.dumps(grad_gate), flush=True)
+    if not grad_gate["accepted"]:
+        raise AssertionError(f"grouped backward parity failed: {grad_gate}")
 
     if args.benchmark_only:
         batch_sizes = [
