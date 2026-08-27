@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
@@ -49,8 +50,89 @@ def _finalize(events,min_user_len=5):
     freq=Counter(i for s in seqs for i in s)
     return {"sequences":seqs,"n_items":len(item_map),"frequency":freq}
 
+
+def _load_ml1m_fast(path, data_dir, min_user_len=5):
+    """Protocol-preserving fast parser for MovieLens-1M.
+
+    The legacy loader used pandas' Python CSV engine for the '::' delimiter,
+    which is very slow on Colab. This implementation parses all four integer
+    columns with NumPy, preserves first-seen user order, timestamp ordering
+    (stable for ties), consecutive-item de-duplication, and the existing
+    lexicographic string item-ID remapping used by `_finalize`.
+
+    The processed result is cached beside the archive. Subsequent runs skip the
+    million-row parse entirely.
+    """
+    data_dir = Path(data_dir)
+    cache = data_dir / f"ml1m_preprocessed_protocol_v1_min{int(min_user_len)}.pt"
+    if cache.exists():
+        return torch.load(cache, map_location="cpu", weights_only=False)
+
+    with zipfile.ZipFile(path) as z:
+        raw = z.read("ml-1m/ratings.dat")
+
+    # ~24 MB input: replacing the delimiter and parsing in NumPy is much faster
+    # than pandas engine='python'. Columns are user, item, rating, timestamp.
+    text = raw.replace(b"::", b" ").decode("ascii")
+    arr = np.fromstring(text, sep=" ", dtype=np.int64)
+    if arr.size % 4:
+        raise ValueError(f"Unexpected ML-1M field count: {arr.size}")
+    arr = arr.reshape(-1, 4)
+    user = arr[:, 0]
+    item = arr[:, 1]
+    ts = arr[:, 3]
+    original_row = np.arange(arr.shape[0], dtype=np.int64)
+
+    # Preserve the dict insertion order of the old `_finalize`: user order is
+    # first occurrence in the source file, while events within a user are sorted
+    # by timestamp and retain source order for timestamp ties.
+    users_unique, first = np.unique(user, return_index=True)
+    users_in_source_order = users_unique[np.argsort(first)]
+    max_user = int(user.max())
+    rank = np.empty(max_user + 1, dtype=np.int64)
+    rank.fill(-1)
+    rank[users_in_source_order] = np.arange(users_in_source_order.size)
+    user_rank = rank[user]
+    order = np.lexsort((original_row, ts, user_rank))
+    user_s = user[order]
+    item_s = item[order]
+
+    starts = np.flatnonzero(np.r_[True, user_s[1:] != user_s[:-1]])
+    ends = np.r_[starts[1:], user_s.size]
+    raw_sequences = []
+    for a, b in zip(starts.tolist(), ends.tolist()):
+        s = item_s[a:b]
+        if s.size:
+            keep = np.r_[True, s[1:] != s[:-1]]
+            s = s[keep]
+        if s.size >= min_user_len:
+            raw_sequences.append(s)
+
+    if not raw_sequences:
+        raise ValueError("ML-1M preprocessing produced no users")
+
+    # Match old string-based sorted item map exactly: '1','10','100',...,'2'.
+    used_raw = np.unique(np.concatenate(raw_sequences))
+    lex_items = sorted((int(x) for x in used_raw.tolist()), key=lambda x: str(x))
+    lookup = np.zeros(int(used_raw.max()) + 1, dtype=np.int64)
+    for mapped, raw_id in enumerate(lex_items, start=1):
+        lookup[raw_id] = mapped
+
+    seqs = [lookup[s].tolist() for s in raw_sequences]
+    flat = np.concatenate([lookup[s] for s in raw_sequences])
+    counts = np.bincount(flat, minlength=len(lex_items) + 1)
+    freq = Counter({i: int(counts[i]) for i in range(1, len(counts)) if counts[i]})
+    out = {"sequences": seqs, "n_items": len(lex_items), "frequency": freq}
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(out, cache)
+    return out
+
+
 def load_dataset(name,data_dir="/content/sparsewalker_data",min_user_len=5):
     spec=DATASETS[name]; path=_download(spec.url,Path(data_dir)/spec.filename)
+    if spec.kind=="ml1m":
+        out=_load_ml1m_fast(path,data_dir,min_user_len); out["spec"]=spec; return out
+
     events=[]
     if spec.kind=="amazon":
         with gzip.open(path,"rt",encoding="utf-8") as f:
@@ -59,11 +141,7 @@ def load_dataset(name,data_dir="/content/sparsewalker_data",min_user_len=5):
     else:
         with zipfile.ZipFile(path) as z:
             with z.open(spec.archive_member) as fh:
-                if spec.kind=="ml1m":
-                    import io
-                    df=pd.read_csv(io.TextIOWrapper(fh,encoding="latin-1"),sep="::",engine="python",names=["user","item","rating","ts"])
-                else:
-                    df=pd.read_csv(fh); df=df.rename(columns={"userId":"user","movieId":"item","timestamp":"ts"})
+                df=pd.read_csv(fh); df=df.rename(columns={"userId":"user","movieId":"item","timestamp":"ts"})
         events=list(df[["user","item","ts"]].itertuples(index=False,name=None))
     out=_finalize(events,min_user_len); out["spec"]=spec; return out
 
