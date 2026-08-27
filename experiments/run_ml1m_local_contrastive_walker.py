@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-"""Experiment 43 v2: backward-free Local-Contrastive SparseWalker on ML-1M.
+"""Experiment 43 v3: backward-free Local-Contrastive SparseWalker on ML-1M.
 
-Same learning rule as the successful Beauty Experiment 39, but with an ML-1M
-execution path that removes padding work, buckets similar sequence lengths, and
-uses the Beauty batch size (512). No optimizer, backward(), or autograd grads.
+Same learning rule as the successful Beauty Experiment 39, with execution-only
+speed fixes for long histories: batch 512, length bucketing, active-row
+compaction, fast/cached ML-1M preprocessing, and no random-init full-catalog
+ranking pass. No optimizer, backward(), or autograd gradients.
 """
 import argparse
 import json
@@ -35,7 +36,7 @@ def build(n_items):
 
 
 @torch.no_grad()
-def evaluate(model, split, n_items, device, batch):
+def evaluate_both(model, split, n_items, device, batch):
     model.eval()
     val = evaluate_full(
         model, split["val_prefix"], split["val_target"], n_items,
@@ -49,11 +50,6 @@ def evaluate(model, split, n_items, device, batch):
 
 
 def _loader(ds, batch_size, epoch, bucket_by_length=True):
-    """Deterministic epoch shuffle with optional length bucketing.
-
-    Bucketing changes batch composition only. WindowDataset still samples the
-    same per-user window for a given epoch/seed.
-    """
     ds.set_epoch(epoch)
     g = torch.Generator()
     g.manual_seed(ds.seed + epoch)
@@ -64,7 +60,6 @@ def _loader(ds, batch_size, epoch, bucket_by_length=True):
         )
 
     indices = torch.randperm(len(ds), generator=g).tolist()
-    # Python sort is stable, so equal-length users retain randomized order.
     indices.sort(key=lambda i: min(len(ds.seqs[i]), ds.max_len + 1))
     batches = [indices[i:i + batch_size] for i in range(0, len(indices), batch_size)]
     if len(batches) > 1:
@@ -77,7 +72,7 @@ def _loader(ds, batch_size, epoch, bucket_by_length=True):
 
 @torch.no_grad()
 def train_epoch_fast(model, ds, device, args, epoch):
-    """Experiment-39 local rules, but compute only rows active at each time step."""
+    """Experiment-39 local rules, computing only active rows at each timestep."""
     model.eval()
     ngen = torch.Generator(device=device)
     ngen.manual_seed(args.seed * 100003 + epoch)
@@ -103,7 +98,6 @@ def train_epoch_fast(model, ds, device, args, epoch):
         mass = torch.zeros(B, model.active, device=device)
 
         for t in range(L):
-            # Critical ML-1M speed fix: do not run router/graph for padded rows.
             active_rows = x[:, t].ne(0).nonzero(as_tuple=False).squeeze(-1)
             if active_rows.numel() == 0:
                 continue
@@ -223,12 +217,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--epochs", type=int, default=70)
-    # 512 is the successful Experiment-39 batch size; 128 was an unnecessary
-    # carry-over from the gradient ML-1M baseline and caused huge Python overhead.
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--eval-batch-size", type=int, default=1024)
     p.add_argument("--eval-every", type=int, default=1)
-    p.add_argument("--progress-every", type=int, default=2)
+    p.add_argument("--progress-every", type=int, default=1)
     p.add_argument("--no-length-bucketing", action="store_true")
     p.add_argument("--negatives", type=int, default=32)
     p.add_argument("--temperature", type=float, default=.15)
@@ -254,13 +246,22 @@ def main():
     torch.set_float32_matmul_precision("high")
     base.seed_all(a.seed)
 
+    print("ML1M_DATA_LOAD_START", json.dumps({"data_dir": a.data_dir}), flush=True)
+    load_t0 = time.perf_counter()
     data = load_dataset("ml1m", a.data_dir)
     split = split_data(data["sequences"])
     print(
-        "ML1M_PROTOCOL",
+        "ML1M_DATA_LOAD_DONE",
         json.dumps({
+            "seconds": round(time.perf_counter() - load_t0, 2),
             "users": len(data["sequences"]),
             "n_items": data["n_items"],
+        }),
+        flush=True,
+    )
+    print(
+        "ML1M_PROTOCOL",
+        json.dumps({
             "split": "per-user leave-two-out",
             "max_len": MAX_LEN,
             "evaluation": "full catalog, seen-item masking",
@@ -274,20 +275,17 @@ def main():
         flush=True,
     )
 
+    print("ML1M_MODEL_INIT_START", flush=True)
     model = build(data["n_items"]).to(device)
     base.init_model(model, a.seed, a.message_gain)
-
-    init_val, init_test = evaluate(
-        model, split, data["n_items"], device, a.eval_batch_size
-    )
-    print("ML1M_LC_INIT", json.dumps({"val": init_val, "test": init_test}), flush=True)
+    print("ML1M_MODEL_INIT_DONE", flush=True)
 
     ds = WindowDataset(split["train"], MAX_LEN, a.seed)
     out = Path(a.output_dir) / f"seed{a.seed}"
     out.mkdir(parents=True, exist_ok=True)
 
     cfg = {
-        "experiment": "ML1M-LocalContrastiveWalker-v2-fast",
+        "experiment": "ML1M-LocalContrastiveWalker-v3-fast-cache",
         "source_rule": "Experiment 39 local-contrastive learning rule",
         "dataset": "ml1m",
         "max_len": MAX_LEN,
@@ -302,6 +300,8 @@ def main():
             "active_row_compaction": True,
             "length_bucketing": not a.no_length_bucketing,
             "batch_size": a.batch_size,
+            "fast_cached_ml1m": True,
+            "random_init_full_catalog_eval": False,
         },
         "architecture": {
             "d": 64, "concepts": 65536, "K": 8, "degree": 4,
@@ -313,9 +313,9 @@ def main():
     }
     (out / "config.json").write_text(json.dumps(cfg, indent=2, sort_keys=True))
 
-    best = float(init_val["NDCG@10"])
+    best = -1.0
     best_epoch = 0
-    best_state = base.cpu_state(model)
+    best_state = None
     hist = []
     start = 1
 
@@ -335,14 +335,27 @@ def main():
             flush=True,
         )
 
+    print(
+        "ML1M_TRAIN_START",
+        json.dumps({"start_epoch": start, "epochs": a.epochs, "batch_size": a.batch_size}),
+        flush=True,
+    )
+
     for e in range(start, a.epochs + 1):
         stats = train_epoch_fast(model, ds, device, a, e)
         row = dict(stats)
 
         if e == 1 or e % a.eval_every == 0:
+            print("ML1M_VAL_START", json.dumps({"epoch": e}), flush=True)
+            val_t0 = time.perf_counter()
             val = evaluate_full(
                 model, split["val_prefix"], split["val_target"], data["n_items"],
                 MAX_LEN, device, topks=(10,), batch_size=a.eval_batch_size,
+            )
+            print(
+                "ML1M_VAL_DONE",
+                json.dumps({"epoch": e, "seconds": round(time.perf_counter()-val_t0, 2), "NDCG@10": float(val["NDCG@10"])}),
+                flush=True,
             )
             row.update({f"val_{k}": float(v) for k, v in val.items()})
             hist.append(row)
@@ -372,12 +385,13 @@ def main():
             last_path,
         )
 
+    if best_state is None:
+        raise RuntimeError("No validation checkpoint was produced")
     model.load_state_dict(best_state)
     model.to(device)
-    best_val, test = evaluate(model, split, data["n_items"], device, a.eval_batch_size)
+    best_val, test = evaluate_both(model, split, data["n_items"], device, a.eval_batch_size)
     result = {
         "config": cfg,
-        "initial": {"val": init_val, "test": init_test},
         "best_epoch": best_epoch,
         "best_backward_free": {"val": best_val, "test": test},
     }
