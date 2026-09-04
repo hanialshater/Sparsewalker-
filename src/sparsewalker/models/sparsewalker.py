@@ -38,8 +38,11 @@ class CompactGraph(nn.Module):
         self.context_q=nn.Linear(d,h,bias=False); self.scale=nn.Parameter(torch.tensor(math.log(3.0)))
     def topk(self,ids,mass):
         v,slot=mass.topk(self.active,-1); ids=ids.gather(-1,slot); v=v/(v.sum(-1,keepdim=True)+1e-8); return ids,v
-    def forward(self,ids,mass,context,space):
-        if self.training: self.touched[ids.detach().reshape(-1)]=True
+    @torch.no_grad()
+    def mark_touched(self,ids):
+        if ids.numel(): self.touched[ids.detach().reshape(-1)]=True
+    def forward(self,ids,mass,context,space,track_touched=True):
+        if self.training and track_touched: self.mark_touched(ids)
         dest=self.destination[ids].long(); static=self.edge_logits(ids); q=F.normalize(self.context_q(context),dim=-1); key=space.key(dest)
         score=static+torch.exp(self.scale)*(key*q[:,None,None,:]).sum(-1); prob=F.softmax(score,-1)
         B=ids.size(0); return self.topk(dest.reshape(B,-1),(mass.unsqueeze(-1)*prob).reshape(B,-1))
@@ -68,20 +71,30 @@ class SparseWalker(ARRecommender):
         v,s=mass.topk(self.active,-1); ids=ids.gather(-1,s); v=v/(v.sum(-1,keepdim=True)+1e-8); return ids,v
     def _merge(self,oi,om,fi,fm):
         return self._top(torch.cat([oi,fi],-1),torch.cat([(1-self.fresh_weight)*om,self.fresh_weight*fm],-1))
-    def encode_with_states(self,seq):
+    def _encode_impl(self,seq,return_states):
         B,L=seq.shape; valid=seq!=0; item_state=self.item(seq)*math.sqrt(self.d_model)
         fi,fm=self.router(item_state.reshape(B*L,self.d_model),self.space); fi=fi.view(B,L,-1); fm=fm.view(B,L,-1)
         ids=torch.zeros(B,self.active,dtype=torch.long,device=seq.device); mass=torch.zeros(B,self.active,dtype=item_state.dtype,device=seq.device)
-        outs=[]; ids_hist=[]; mass_hist=[]
+        outs=[]; ids_hist=[] if return_states else None; mass_hist=[] if return_states else None
+        touched_sources=[] if self.training else None
         for t in range(L):
             act=valid[:,t]; af=act.to(item_state.dtype)[:,None]; xids=ids; xmass=mass*af; fids=fi[:,t]; fmass=fm[:,t]*af
             for _ in range(self.layers_n):
-                xids,xmass=self._merge(xids,xmass,fids,fmass); xids,xmass=self.graph(xids,xmass,item_state[:,t],self.space)
+                xids,xmass=self._merge(xids,xmass,fids,fmass)
+                if touched_sources is not None: touched_sources.append(xids.detach())
+                xids,xmass=self.graph(xids,xmass,item_state[:,t],self.space,track_touched=False)
             ids=torch.where(act[:,None],xids,ids); mass=torch.where(act[:,None],xmass,mass)
             msg=(self.space.value(ids)*mass[:,:,None]).sum(1); h=self.norm(item_state[:,t]+self.message_proj(msg))*af
-            outs.append(h); ids_hist.append(ids); mass_hist.append(mass)
-        return torch.stack(outs,1),torch.stack(ids_hist,1),torch.stack(mass_hist,1)
-    def encode(self,seq): return self.encode_with_states(seq)[0]
+            outs.append(h)
+            if return_states:
+                ids_hist.append(ids); mass_hist.append(mass)
+        if touched_sources:
+            self.graph.mark_touched(torch.cat([x.reshape(-1) for x in touched_sources],0))
+        H=torch.stack(outs,1)
+        if return_states: return H,torch.stack(ids_hist,1),torch.stack(mass_hist,1)
+        return H
+    def encode_with_states(self,seq): return self._encode_impl(seq,True)
+    def encode(self,seq): return self._encode_impl(seq,False)
 
 class SparseWalkerE2E(SparseWalker):
     def __init__(self,n_items,max_len,d=64,layers=2,side=256,h=16,active=8,top_side=2,degree=4,fresh_weight=.25,terminal_degree=128):
